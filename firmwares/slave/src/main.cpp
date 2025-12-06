@@ -1,0 +1,282 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/event_groups.h>
+#include "time.h"
+
+// ----------------- CONFIGURAÇÕES -----------------
+uint8_t masterMacAddress[] = {0xB8, 0xF8, 0x62, 0xE2, 0x8A, 0xF8}; // B8:F8:62:E2:8A:F8
+const int SENSOR_INTERVAL_MS = 10000; // Ler a cada 30s
+const int TIME_SYNC_INTERVAL_MS   = 3600000; // Sincronizar relógio a cada 1h
+const int SEND_JITTER_MAX_MS = 500;   // Jitter aleatório
+// -------------------------------------------------
+
+// --- ESTRUTURAS ---
+typedef enum {
+    SENSOR_TYPE_TEMPERATURE,
+    SENSOR_TYPE_HUMIDITY,
+    SENSOR_TYPE_LDR,
+    SENSOR_TYPE_GAS_MQ135,
+    SENSOR_TYPE_GAS_MQ2,
+    SENSOR_TYPE_TIME_SYNC_REQUEST
+} sensor_type_t;
+
+typedef struct {
+    char timestamp[21];
+    sensor_type_t type;
+    float value;
+} sensor_payload_t;
+
+typedef struct {
+    unsigned long epoch;
+} time_sync_response_t;
+
+typedef struct {
+  sensor_type_t type;
+  int sensor_gpio_pin;
+  float min_value; // -999999 se não aplicável
+  float max_value; // 999999 se não aplicável
+} sensor_config_t;
+
+// --- GLOBAIS ---
+bool alertEnabled = false;
+const int BEEP_DELAY_MS = 5000;
+
+// --- GLOBAIS FREERTOS ---
+QueueHandle_t g_sensor_queue;
+QueueHandle_t g_sdcard_queue;
+EventGroupHandle_t g_evt_group;
+#define BIT_ACK_SUCCESS  BIT0
+#define BIT_ACK_FAIL     BIT1
+#define BIT_SYNC_DONE    BIT2
+
+// --- GLOBAIS DE TEMPO ---
+unsigned long g_epoch_base = 0;
+unsigned long g_millis_base = 0;
+bool g_is_synced = false;
+
+// --- Configurações de GPIO ---
+const int PIN_BUILTIN_LED = 2;
+const int PIN_BUZZER = 23;
+
+// --- Configurações Sensores ---
+const sensor_config_t dht11_temperature_sensor = {SENSOR_TYPE_TEMPERATURE, 32, 16.0, 40.0};
+const sensor_config_t dht11_humidity_sensor = {SENSOR_TYPE_HUMIDITY, 32, 20.0, 85.0};
+const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, 34, 1023.0, 3069.0};
+const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, 35, 1023.0, 3069.0};
+const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, 36, 1023.0, 3069.0};
+
+// Modo de Teste (Simula sensores com valores aleatórios)
+bool system_test_mode = true;
+
+// Protótipos de funções
+void get_iso_timestamp(char* buffer);
+void check_value_bounds(sensor_payload_t* data, const sensor_config_t* config);
+void ligarAlerta();
+
+// --- CALLBACKS ESP-NOW ---
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    if (status == ESP_NOW_SEND_SUCCESS) 
+        xEventGroupSetBitsFromISR(g_evt_group, BIT_ACK_SUCCESS, &xHigherPriorityTaskWoken);
+    else 
+        xEventGroupSetBitsFromISR(g_evt_group, BIT_ACK_FAIL, &xHigherPriorityTaskWoken);
+        
+    if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+}
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+    // Se receber resposta de tempo do Master
+    if (len == sizeof(time_sync_response_t)) {
+        time_sync_response_t *resp = (time_sync_response_t *)incomingData;
+        g_epoch_base = resp->epoch;
+        g_millis_base = millis();
+        g_is_synced = true;
+        
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        xEventGroupSetBitsFromISR(g_evt_group, BIT_SYNC_DONE, &xHigherPriorityTaskWoken);
+        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+    }
+}
+
+// --- HELPER DE TIMESTAMP ---
+void get_iso_timestamp(char* buffer) {
+    if (!g_is_synced) {
+        strcpy(buffer, "1970-01-01T00:00:00Z");
+        return;
+    }
+    // Calcula hora atual baseada no delta do millis
+    unsigned long current_epoch = g_epoch_base + ((millis() - g_millis_base) / 1000);
+    struct tm * ti;
+    time_t rawtime = (time_t)current_epoch;
+    ti = localtime(&rawtime);
+    
+    sprintf(buffer, "%04d-%02d-%02dT%02d:%02d:%02dZ", 
+            ti->tm_year + 1900, ti->tm_mon + 1, ti->tm_mday, 
+            ti->tm_hour, ti->tm_min, ti->tm_sec);
+}
+
+// --- TAREFA: SINCRONIZAÇÃO DE TEMPO ---
+void vTimeSyncTask(void *pvParam) {
+    for (;;) {
+        sensor_payload_t req;
+        req.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
+        req.value = 0;
+        strcpy(req.timestamp, ""); // Vazio
+
+        Serial.println("[Sync] Solicitando hora ao Master...");
+        esp_now_send(masterMacAddress, (uint8_t *)&req, sizeof(req));
+
+        // Espera resposta por 2 segundos
+        EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_SYNC_DONE, pdTRUE, pdFALSE, pdMS_TO_TICKS(2000));
+        
+        if (bits & BIT_SYNC_DONE) {
+            char timestamp[21];
+            get_iso_timestamp(timestamp);
+            Serial.printf("[Sync] Sucesso! Hora atual sincronizada (%s).\n", timestamp);
+            vTaskDelay(pdMS_TO_TICKS(TIME_SYNC_INTERVAL_MS)); // Dorme 1h
+        } else {
+            Serial.println("[Sync] Falha/Timeout. Tentando novamente em 10s...");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+}
+
+void check_value_bounds(sensor_payload_t* data, const sensor_config_t* config) {
+  bool isBelowMin = (config->min_value >= -999999) && (config->min_value > data->value);
+  bool isAboveMax = (config->max_value <= 999999) && (config->max_value < data->value);
+    if (isBelowMin || isAboveMax) {
+        Serial.printf("[Alert] Valor fora dos limites para sensor %d: %.2f (Min: %.2f, Max: %.2f)\n", 
+                      data->type, data->value, config->min_value, config->max_value);
+        // Aciona modo alerta
+        ligarAlerta();
+    }
+}
+
+// --- TAREFA: ENVIO (Consumidor da Fila) ---
+void vSenderTask(void *pvParam) {
+    sensor_payload_t data;
+    for (;;) {
+        if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE) {
+            bool sent = false;
+            int retries = 0;
+
+            while (!sent && retries < 3) {
+                // JITTER: Espera aleatória 0-500ms
+                vTaskDelay(pdMS_TO_TICKS(random(0, SEND_JITTER_MAX_MS)));
+
+                xEventGroupClearBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL);
+                esp_now_send(masterMacAddress, (uint8_t *)&data, sizeof(data));
+
+                EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL, pdTRUE, pdFALSE, pdMS_TO_TICKS(1000));
+
+                if (bits & BIT_ACK_SUCCESS) {
+                    Serial.printf("[Sender] Enviado OK! Val: %.2f\n", data.value);
+                    sent = true;
+                } else {
+                    Serial.println("[Sender] Falha/Sem ACK. Tentando novamente...");
+                    retries++;
+                }
+            }
+        }
+    }
+}
+
+// --- TAREFAS: SENSORES ---
+void vSensorDHT11(void *pvParam) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+
+        // Leitura de Temperatura:
+        data.type = SENSOR_TYPE_TEMPERATURE;
+        data.value = random(2000, 3500) / 100.0; // Simula 20.00 a 35.00
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &dht11_temperature_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+
+        // Leitura de Umidade:
+        data.type = SENSOR_TYPE_HUMIDITY;
+        data.value = random(0, 100); // Simula 0.00 a 100.00
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &dht11_humidity_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+    }
+}
+
+void vSensorMQ135(void *pvParam) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+
+        data.type = SENSOR_TYPE_GAS_MQ135;
+        data.value = random(0, 4095); // Simula 0 a 4095
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &mq135_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+    }
+}
+
+void vTaskBuzzer(void *parameter) {
+  pinMode(PIN_BUZZER, OUTPUT);
+
+  for(;;) { // Loop infinito da Task
+    if (alertEnabled) {
+      Serial.println("[Alert] ALERTA LIGADO!");
+      digitalWrite(PIN_BUZZER, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(BEEP_DELAY_MS));
+      digitalWrite(PIN_BUZZER, LOW);
+
+      alertEnabled = false; // Desliga o modo alerta após um beep
+      Serial.println("[Alert] ALERTA DESLIGADO!");
+    } else {
+      digitalWrite(PIN_BUZZER, LOW);
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+void ligarAlerta() {
+  alertEnabled = true;
+}
+
+void setup() {
+    pinMode(PIN_BUILTIN_LED, OUTPUT);
+    digitalWrite(PIN_BUILTIN_LED, LOW); // Desliga LED interno
+
+    pinMode(PIN_BUZZER, OUTPUT);
+    digitalWrite(PIN_BUZZER, LOW); // Desliga Buzzer
+
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
+    
+    if (esp_now_init() != ESP_OK) { Serial.println("Erro ESP-NOW"); return; }
+    
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv); // Necessário para receber Hora
+
+    // Configura Peer (Master)
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, masterMacAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+
+    // FreeRTOS
+    g_sensor_queue = xQueueCreate(10, sizeof(sensor_payload_t));
+    g_evt_group = xEventGroupCreate();
+
+    xTaskCreate(vTimeSyncTask, "Sync", 2048, NULL, 3, NULL); // Prioridade Alta
+    xTaskCreate(vSenderTask, "Send", 4096, NULL, 2, NULL);
+    xTaskCreate(vSensorDHT11, "DHT11", 2048, NULL, 1, NULL);
+    xTaskCreate(vSensorMQ135, "MQ135", 2048, NULL, 1, NULL);
+    xTaskCreate(vTaskBuzzer, "BuzzerTask", 1024, NULL, 1, NULL);
+}
+
+void loop() {
+    vTaskDelete(NULL);
+}
