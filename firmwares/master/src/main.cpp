@@ -87,6 +87,13 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
             peerInfo.channel = 0;
             peerInfo.encrypt = false;
             esp_now_add_peer(&peerInfo);
+
+            // Verifica erro ao adicionar
+            esp_err_t addStatus = esp_now_add_peer(&peerInfo);
+            if (addStatus == ESP_ERR_ESPNOW_FULL) {
+                Serial.println("ERRO: Lista de Peers cheia! O Master não pode responder.");
+                // Opcional: Limpar um peer antigo aqui seria uma lógica avançada
+            }
         }
 
         // Pega hora NTP
