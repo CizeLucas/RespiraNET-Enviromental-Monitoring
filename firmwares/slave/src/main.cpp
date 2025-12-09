@@ -1,5 +1,6 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -43,6 +44,7 @@ typedef struct {
 // --- GLOBAIS ---
 bool alertEnabled = false;
 const int BEEP_DELAY_MS = 5000;
+bool canSendSensorData = false;
 
 // --- GLOBAIS FREERTOS ---
 QueueHandle_t g_sensor_queue;
@@ -135,6 +137,7 @@ void vTimeSyncTask(void *pvParam) {
         if (bits & BIT_SYNC_DONE) {
             char timestamp[21];
             get_iso_timestamp(timestamp);
+            canSendSensorData = true;
             Serial.printf("[Sync] Sucesso! Hora atual sincronizada (%s).\n", timestamp);
             vTaskDelay(pdMS_TO_TICKS(TIME_SYNC_INTERVAL_MS)); // Dorme 1h
         } else {
@@ -162,8 +165,11 @@ void vSenderTask(void *pvParam) {
         if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE) {
             bool sent = false;
             int retries = 0;
+            
+            Serial.printf("[Sender] Enviando dado do sensor %d: %.2f\n", data.type, data.value);
 
-            while (!sent && retries < 3) {
+
+            while (canSendSensorData && !sent && retries < 3) {
                 // JITTER: Espera aleatória 0-500ms
                 vTaskDelay(pdMS_TO_TICKS(random(0, SEND_JITTER_MAX_MS)));
 
@@ -244,6 +250,49 @@ void ligarAlerta() {
   alertEnabled = true;
 }
 
+// --- FUNÇÃO DE VARREDURA DE CANAL ---
+void scanForMaster() {
+    int32_t channel = 1;
+    bool found = false;
+    
+    Serial.println("[Scan] Procurando o Master nos canais Wi-Fi...");
+
+    // Tenta nos canais 1 a 13
+    for (channel = 1; channel <= 13; channel++) {
+        // Muda o canal do rádio
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_promiscuous(false);
+        
+        Serial.printf("... Testando Canal %d\n", channel);
+
+        // Envia um pacote de teste (Sync Request é leve)
+        sensor_payload_t ping;
+        ping.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
+        strcpy(ping.timestamp, "");
+        ping.value = 0;
+
+        // Limpa flags
+        xEventGroupClearBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL);
+        
+        // Envia
+        esp_now_send(masterMacAddress, (uint8_t *)&ping, sizeof(ping));
+
+        // Espera ACK por 100ms (rápido)
+        EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_ACK_SUCCESS, pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
+
+        if (bits & BIT_ACK_SUCCESS) {
+            Serial.printf("[Scan] Mestre encontrado no Canal %d!\n", channel);
+            found = true;
+            break; // Sai do loop, estamos no canal certo
+        }
+    }
+
+    if (!found) {
+        Serial.println("[Scan] Mestre NÃO encontrado. Mantendo canal padrão (1).");
+    }
+}
+
 void setup() {
     pinMode(PIN_BUILTIN_LED, OUTPUT);
     digitalWrite(PIN_BUILTIN_LED, LOW); // Desliga LED interno
@@ -269,6 +318,8 @@ void setup() {
     // FreeRTOS
     g_sensor_queue = xQueueCreate(10, sizeof(sensor_payload_t));
     g_evt_group = xEventGroupCreate();
+
+    scanForMaster();
 
     xTaskCreate(vTimeSyncTask, "Sync", 2048, NULL, 3, NULL); // Prioridade Alta
     xTaskCreate(vSenderTask, "Send", 4096, NULL, 2, NULL);
