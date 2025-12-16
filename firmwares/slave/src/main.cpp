@@ -6,6 +6,7 @@
 #include <freertos/queue.h>
 #include <freertos/event_groups.h>
 #include "time.h"
+#include <DHT.h>
 
 // ----------------- CONFIGURAÇÕES -----------------
 uint8_t masterMacAddress[] = {0xB8, 0xF8, 0x62, 0xE2, 0x8A, 0xF8}; // B8:F8:62:E2:8A:F8
@@ -64,14 +65,21 @@ const int PIN_BUILTIN_LED = 2;
 const int PIN_BUZZER = 23;
 
 // --- Configurações Sensores ---
-const sensor_config_t dht11_temperature_sensor = {SENSOR_TYPE_TEMPERATURE, 32, 16.0, 40.0};
-const sensor_config_t dht11_humidity_sensor = {SENSOR_TYPE_HUMIDITY, 32, 20.0, 85.0};
-const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, 34, 1023.0, 3069.0};
-const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, 35, 1023.0, 3069.0};
-const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, 36, 1023.0, 3069.0};
+const int DHT11_PIN = 32;
+const int LDR_PIN = 34;
+const int MQ135_PIN = 35;
+const int MQ2_PIN = 36;
+const sensor_config_t dht11_temperature_sensor = {SENSOR_TYPE_TEMPERATURE, DHT11_PIN, 16.0, 40.0};
+const sensor_config_t dht11_humidity_sensor = {SENSOR_TYPE_HUMIDITY, DHT11_PIN, 20.0, 85.0};
+const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, LDR_PIN, 1023.0, 3069.0};
+const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, MQ135_PIN, 1023.0, 3069.0};
+const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, MQ2_PIN, 1023.0, 3069.0};
+
+// --- OBJETOS GLOBAIS ---
+DHT dht(DHT11_PIN, DHT11);
 
 // Modo de Teste (Simula sensores com valores aleatórios)
-bool system_test_mode = true;
+const bool system_test_mode = false;
 
 // Protótipos de funções
 void get_iso_timestamp(char* buffer);
@@ -186,12 +194,83 @@ void vSenderTask(void *pvParam) {
                     retries++;
                 }
             }
+
+            if (!sent) {
+                Serial.printf("[Sender] Falha ao enviar dado do sensor %d após 3 tentativas.\n", data.type);
+                //TODO: Popular fila de falhas para serem gravadas no SD Card
+            }
         }
     }
 }
 
 // --- TAREFAS: SENSORES ---
 void vSensorDHT11(void *pvParam) {
+    dht.begin();
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+
+        // Leitura de Temperatura:
+        float t = dht.readTemperature();
+        if (!isnan(t)) {
+            data.type = SENSOR_TYPE_TEMPERATURE;
+            data.value = t;
+            get_iso_timestamp(data.timestamp);
+            check_value_bounds(&data, &dht11_temperature_sensor);
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        } else {
+            Serial.println("[DHT11] Falha na leitura de Temperatura!");
+        }
+
+        // Leitura de Umidade:
+        float h = dht.readHumidity();
+        if (!isnan(h)) {
+            data.type = SENSOR_TYPE_HUMIDITY;
+            data.value = h;
+            get_iso_timestamp(data.timestamp);
+            check_value_bounds(&data, &dht11_humidity_sensor);
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        } else {
+            Serial.println("[DHT11] Falha na leitura de Umidade!");
+        }
+    }
+}
+
+void vSensorMQ135(void *pvParam) {
+    pinMode(MQ135_PIN, INPUT);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+        int raw_value = analogRead(MQ135_PIN);
+
+        data.type = SENSOR_TYPE_GAS_MQ135;
+        data.value = (float)raw_value; 
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &mq135_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+    }
+}
+
+void vSensorLDR(void *pvParam) {
+    pinMode(LDR_PIN, INPUT);
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+        int raw_value = analogRead(LDR_PIN);
+
+        data.type = SENSOR_TYPE_LDR;
+        data.value = (float)raw_value;
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &ldr_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+    }
+}
+
+// --- IMPLEMENTAÇÃO DE TAREFAS MOCKADAS DE SENSORES (TESTE) ---
+void vMockedSensorDHT11(void *pvParam) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -213,7 +292,21 @@ void vSensorDHT11(void *pvParam) {
     }
 }
 
-void vSensorMQ135(void *pvParam) {
+void vMockedSensorMQ135(void *pvParam) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
+        
+        sensor_payload_t data;
+
+        data.type = SENSOR_TYPE_GAS_MQ135;
+        data.value = random(0, 4095); // Simula 0 a 4095
+        get_iso_timestamp(data.timestamp);
+        check_value_bounds(&data, &mq135_sensor);
+        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+    }
+}
+
+void vMockedSensorLDR(void *pvParam) {
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -323,8 +416,9 @@ void setup() {
 
     xTaskCreate(vTimeSyncTask, "Sync", 2048, NULL, 3, NULL); // Prioridade Alta
     xTaskCreate(vSenderTask, "Send", 4096, NULL, 2, NULL);
-    xTaskCreate(vSensorDHT11, "DHT11", 2048, NULL, 1, NULL);
-    xTaskCreate(vSensorMQ135, "MQ135", 2048, NULL, 1, NULL);
+    xTaskCreate(system_test_mode ? vMockedSensorDHT11 : vSensorDHT11, "DHT11", 2048, NULL, 1, NULL);
+    xTaskCreate(system_test_mode ? vMockedSensorMQ135 : vSensorMQ135, "MQ135", 2048, NULL, 1, NULL);
+    xTaskCreate(system_test_mode ? vMockedSensorLDR : vSensorLDR, "LDR", 2048, NULL, 1, NULL);
     xTaskCreate(vTaskBuzzer, "BuzzerTask", 1024, NULL, 1, NULL);
 }
 
