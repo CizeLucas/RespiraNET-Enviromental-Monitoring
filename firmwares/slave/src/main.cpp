@@ -85,6 +85,7 @@ const bool system_test_mode = true;
 void get_iso_timestamp(char* buffer);
 void check_value_bounds(sensor_payload_t* data, const sensor_config_t* config);
 void ligarAlerta();
+void scanForMaster();
 
 // --- CALLBACKS ESP-NOW ---
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
@@ -194,10 +195,13 @@ void vSenderTask(void *pvParam) {
                     retries++;
                 }
             }
-
+            
             if (!sent) {
                 Serial.printf("[Sender] Falha ao enviar dado %.2f do sensor %d após 3 tentativas.\n", data.value, data.type);
-                //TODO: Implementar lógica de re-escaneamento do canal caso falhe aqui
+                
+                Serial.println("[Sender] Iniciando re-escaneamento do Master...");
+                scanForMaster();
+
                 //TODO: Popular fila de falhas para serem gravadas no SD Card
             }
         }
