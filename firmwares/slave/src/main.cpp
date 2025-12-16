@@ -51,9 +51,9 @@ bool canSendSensorData = false;
 QueueHandle_t g_sensor_queue;
 QueueHandle_t g_sdcard_queue;
 EventGroupHandle_t g_evt_group;
-#define BIT_ACK_SUCCESS  BIT0
-#define BIT_ACK_FAIL     BIT1
-#define BIT_SYNC_DONE    BIT2
+#define BIT_ACK_SUCCESS  BIT0  // O envio ESP-NOW foi recebido com sucesso pelo destinatário
+#define BIT_ACK_FAIL     BIT1  // O envio falhou (destinatário não recebeu)
+#define BIT_SYNC_DONE    BIT2  // A resposta de sincronização de tempo chegou
 
 // --- GLOBAIS DE TEMPO ---
 unsigned long g_epoch_base = 0;
@@ -79,7 +79,7 @@ const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, MQ2_PIN, 1023.0, 3069.0
 DHT dht(DHT11_PIN, DHT11);
 
 // Modo de Teste (Simula sensores com valores aleatórios)
-const bool system_test_mode = false;
+const bool system_test_mode = true;
 
 // Protótipos de funções
 void get_iso_timestamp(char* buffer);
@@ -170,14 +170,14 @@ void check_value_bounds(sensor_payload_t* data, const sensor_config_t* config) {
 void vSenderTask(void *pvParam) {
     sensor_payload_t data;
     for (;;) {
-        if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE) {
+        // Consome a fila e caso tenha a hora sincronizada, envia os dados
+        if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE && canSendSensorData) {
             bool sent = false;
             int retries = 0;
             
             Serial.printf("[Sender] Enviando dado do sensor %d: %.2f\n", data.type, data.value);
 
-
-            while (canSendSensorData && !sent && retries < 3) {
+            while (!sent && retries < 3) {
                 // JITTER: Espera aleatória 0-500ms
                 vTaskDelay(pdMS_TO_TICKS(random(0, SEND_JITTER_MAX_MS)));
 
@@ -190,13 +190,14 @@ void vSenderTask(void *pvParam) {
                     Serial.printf("[Sender] Enviado OK! Val: %.2f\n", data.value);
                     sent = true;
                 } else {
-                    Serial.println("[Sender] Falha/Sem ACK. Tentando novamente...");
+                    Serial.printf("[Sender] Falha/Sem ACK. Tentando novamente... (Sensor: %d Val: %.2f)\n", data.type, data.value);
                     retries++;
                 }
             }
 
             if (!sent) {
-                Serial.printf("[Sender] Falha ao enviar dado do sensor %d após 3 tentativas.\n", data.type);
+                Serial.printf("[Sender] Falha ao enviar dado %.2f do sensor %d após 3 tentativas.\n", data.value, data.type);
+                //TODO: Implementar lógica de re-escaneamento do canal caso falhe aqui
                 //TODO: Popular fila de falhas para serem gravadas no SD Card
             }
         }
@@ -350,40 +351,44 @@ void scanForMaster() {
     
     Serial.println("[Scan] Procurando o Master nos canais Wi-Fi...");
 
-    // Tenta nos canais 1 a 13
-    for (channel = 1; channel <= 13; channel++) {
-        // Muda o canal do rádio
-        esp_wifi_set_promiscuous(true);
-        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
-        esp_wifi_set_promiscuous(false);
-        
-        Serial.printf("... Testando Canal %d\n", channel);
+    while(!found) {
+        // Tenta nos canais 1 a 13
+        for (channel = 1; channel <= 13; channel++) {
+            // Muda o canal do rádio
+            esp_wifi_set_promiscuous(true);
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            esp_wifi_set_promiscuous(false);
+            
+            Serial.printf("... Testando Canal %d\n", channel);
 
-        // Envia um pacote de teste (Sync Request é leve)
-        sensor_payload_t ping;
-        ping.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
-        strcpy(ping.timestamp, "");
-        ping.value = 0;
+            // Envia um pacote de teste (Sync Request é leve)
+            sensor_payload_t ping;
+            ping.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
+            strcpy(ping.timestamp, "");
+            ping.value = 0;
 
-        // Limpa flags
-        xEventGroupClearBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL);
-        
-        // Envia
-        esp_now_send(masterMacAddress, (uint8_t *)&ping, sizeof(ping));
+            // Limpa flags
+            xEventGroupClearBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL);
+            
+            // Envia
+            esp_now_send(masterMacAddress, (uint8_t *)&ping, sizeof(ping));
 
-        // Espera ACK por 100ms (rápido)
-        EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_ACK_SUCCESS, pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
+            // Espera ACK por 100ms (rápido)
+            EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_ACK_SUCCESS, pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
 
-        if (bits & BIT_ACK_SUCCESS) {
-            Serial.printf("[Scan] Mestre encontrado no Canal %d!\n", channel);
-            found = true;
-            break; // Sai do loop, estamos no canal certo
+            if (bits & BIT_ACK_SUCCESS) {
+                Serial.printf("[Scan] Mestre encontrado no Canal %d!\n", channel);
+                found = true;
+                break; // Sai do loop, estamos no canal certo
+            }
+        }
+
+        if (!found) {
+            Serial.println("[Scan] Mestre NÃO encontrado. Tentando novamente...");
+            vTaskDelay(pdMS_TO_TICKS(2000)); // Espera 2s antes de tentar novamente
         }
     }
 
-    if (!found) {
-        Serial.println("[Scan] Mestre NÃO encontrado. Mantendo canal padrão (1).");
-    }
 }
 
 void setup() {
