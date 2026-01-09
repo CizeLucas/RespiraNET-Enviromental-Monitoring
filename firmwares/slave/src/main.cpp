@@ -53,6 +53,7 @@ EventGroupHandle_t g_evt_group;
 #define BIT_ACK_SUCCESS  BIT0  // O envio ESP-NOW foi recebido com sucesso pelo destinatário
 #define BIT_ACK_FAIL     BIT1  // O envio falhou (destinatário não recebeu)
 #define BIT_SYNC_DONE    BIT2  // A resposta de sincronização de tempo chegou
+#define BIT_TIME_SYNCED  BIT3  // Tempo sincronizado, libera sensores
 
 // --- GLOBAIS DE TEMPO ---
 unsigned long g_epoch_base = 0;
@@ -103,7 +104,6 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         time_sync_response_t *resp = (time_sync_response_t *)incomingData;
         g_epoch_base = resp->epoch;
         g_millis_base = millis();
-        g_is_time_synced = true;
         
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xEventGroupSetBitsFromISR(g_evt_group, BIT_SYNC_DONE, &xHigherPriorityTaskWoken);
@@ -113,10 +113,6 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 
 // --- HELPER DE TIMESTAMP ---
 void get_iso_timestamp(char* buffer) {
-    if (!g_is_time_synced) {
-        strcpy(buffer, "1970-01-01T00:00:00Z");
-        return;
-    }
     // Calcula hora atual baseada no delta do millis
     unsigned long current_epoch = g_epoch_base + ((millis() - g_millis_base) / 1000);
     struct tm * ti;
@@ -130,6 +126,8 @@ void get_iso_timestamp(char* buffer) {
 
 // --- TAREFA: SINCRONIZAÇÃO DE TEMPO ---
 void vTimeSyncTask(void *pvParam) {
+    int tries = 0;
+    
     for (;;) {
         sensor_payload_t req;
         req.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
@@ -144,11 +142,21 @@ void vTimeSyncTask(void *pvParam) {
         
         if (bits & BIT_SYNC_DONE) {
             char timestamp[21];
+            g_is_time_synced = true;
+            xEventGroupSetBits(g_evt_group, BIT_TIME_SYNCED); // Libera sensores
             get_iso_timestamp(timestamp);
-            Serial.printf("[Sync] Sucesso! Hora atual sincronizada (%s).\n", timestamp);
+            Serial.printf("\n[Sync] Sucesso! Hora atual sincronizada (%s).\n", timestamp);
+            tries = 0;
             vTaskDelay(pdMS_TO_TICKS(TIME_SYNC_INTERVAL_MS)); // Dorme 1h
         } else {
-            Serial.println("[Sync] Falha/Timeout. Tentando novamente em 10s...");
+            tries++;
+            Serial.printf("[Sync] Falha/Timeout (Tentativa %d/3). Tentando novamente em 10s...\n", tries);
+            
+            if (tries >= 3) {
+                Serial.println("[Sync] 3 falhas consecutivas. Iniciando re-escaneamento do Master...");
+                scanForMaster();
+                tries = 0;
+            }
             vTaskDelay(pdMS_TO_TICKS(10000));
         }
     }
@@ -209,6 +217,7 @@ void vSenderTask(void *pvParam) {
 // --- TAREFAS: SENSORES ---
 void vSensorDHT11(void *pvParam) {
     dht.begin();
+    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -221,7 +230,12 @@ void vSensorDHT11(void *pvParam) {
             data.value = t;
             get_iso_timestamp(data.timestamp);
             check_value_bounds(&data, &dht11_temperature_sensor);
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+            
+            // Só envia para fila se o tempo estiver sincronizado
+            EventBits_t bits = xEventGroupGetBits(g_evt_group);
+            if (bits & BIT_TIME_SYNCED) {
+                xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+            }
         } else {
             Serial.println("[DHT11] Falha na leitura de Temperatura!");
         }
@@ -233,7 +247,12 @@ void vSensorDHT11(void *pvParam) {
             data.value = h;
             get_iso_timestamp(data.timestamp);
             check_value_bounds(&data, &dht11_humidity_sensor);
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+            
+            // Só envia para fila se o tempo estiver sincronizado
+            EventBits_t bits = xEventGroupGetBits(g_evt_group);
+            if (bits & BIT_TIME_SYNCED) {
+                xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+            }
         } else {
             Serial.println("[DHT11] Falha na leitura de Umidade!");
         }
@@ -242,6 +261,7 @@ void vSensorDHT11(void *pvParam) {
 
 void vSensorMQ135(void *pvParam) {
     pinMode(MQ135_PIN, INPUT);
+    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -252,12 +272,18 @@ void vSensorMQ135(void *pvParam) {
         data.value = (float)raw_value; 
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &mq135_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        EventBits_t bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
     }
 }
 
 void vSensorLDR(void *pvParam) {
     pinMode(LDR_PIN, INPUT);
+    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -268,12 +294,18 @@ void vSensorLDR(void *pvParam) {
         data.value = (float)raw_value;
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &ldr_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        EventBits_t bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
     }
 }
 
 // --- IMPLEMENTAÇÃO DE TAREFAS MOCKADAS DE SENSORES (TESTE) ---
 void vMockedSensorDHT11(void *pvParam) {
+    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -284,18 +316,28 @@ void vMockedSensorDHT11(void *pvParam) {
         data.value = random(2000, 3500) / 100.0; // Simula 20.00 a 35.00
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &dht11_temperature_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        EventBits_t bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
 
         // Leitura de Umidade:
         data.type = SENSOR_TYPE_HUMIDITY;
         data.value = random(0, 100); // Simula 0.00 a 100.00
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &dht11_humidity_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
     }
 }
 
-void vMockedSensorMQ135(void *pvParam) {
+void vMockedSensorMQ135(void *pvParam) {    
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
         
@@ -305,7 +347,12 @@ void vMockedSensorMQ135(void *pvParam) {
         data.value = random(0, 4095); // Simula 0 a 4095
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &mq135_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        EventBits_t bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
     }
 }
 
@@ -319,7 +366,12 @@ void vMockedSensorLDR(void *pvParam) {
         data.value = random(0, 4095); // Simula 0 a 4095
         get_iso_timestamp(data.timestamp);
         check_value_bounds(&data, &mq135_sensor);
-        xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        
+        // Só envia para fila se o tempo estiver sincronizado
+        EventBits_t bits = xEventGroupGetBits(g_evt_group);
+        if (bits & BIT_TIME_SYNCED) {
+            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
+        }
     }
 }
 
