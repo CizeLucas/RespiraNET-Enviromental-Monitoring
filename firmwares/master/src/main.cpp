@@ -4,9 +4,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
+#include <freertos/event_groups.h>
 #include <PubSubClient.h>
 #include "time.h"
 #include "secrets.h"
+
+// --- CONSTANTES ---
+#define NTP_SYNCED_BIT BIT0
 
 // --- ESTRUTURAS DE DADOS ---
 typedef enum {
@@ -37,7 +41,7 @@ typedef struct {
 // --- GLOBAIS ---
 String masterMacAddress = "";
 const int TIME_SYNC_INTERVAL_MS = 3600000;
-volatile bool g_is_time_synced = false;
+EventGroupHandle_t g_time_sync_event_group;
 QueueHandle_t g_incoming_data_queue;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -71,6 +75,13 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
 
     // 2. CASO ESPECIAL: Pedido de Sincronia de Tempo
     if (recvData->type == SENSOR_TYPE_TIME_SYNC_REQUEST) {
+        // Verifica se o tempo NTP foi sincronizado
+        EventBits_t bits = xEventGroupGetBitsFromISR(g_time_sync_event_group);
+        if (!(bits & NTP_SYNCED_BIT)) {
+            // Tempo ainda não sincronizado, ignora o pedido
+            return;
+        }
+        
         // Adiciona o Slave como peer dinamicamente (se não existir) para poder responder
         if (!esp_now_is_peer_exist(mac_addr)) {
             esp_now_peer_info_t peerInfo = {};
@@ -114,11 +125,14 @@ void vMqttSenderTask(void *pvParameters) {
     char payload_json[128];
 
     for(;;) {
-        // Apenas envia dados após sincronização de tempo NTP
-        if(!g_is_time_synced) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
+        // Aguarda sincronização de tempo NTP
+        xEventGroupWaitBits(
+            g_time_sync_event_group,
+            NTP_SYNCED_BIT,
+            pdFALSE,  // Não limpa o bit
+            pdTRUE,   // Espera por todos os bits
+            portMAX_DELAY  // Aguarda indefinidamente
+        );
 
         // Mantém conexão MQTT
         if (!mqttClient.connected()) {
@@ -171,7 +185,8 @@ void vNtpSyncTask(void *pvParameters) {
         }
         
         if (retry < 10) {
-            g_is_time_synced = true;
+            // Sinaliza que o tempo foi sincronizado
+            xEventGroupSetBits(g_time_sync_event_group, NTP_SYNCED_BIT);
             Serial.println("Tempo NTP atualizado com sucesso!");
             Serial.printf("Data/Hora: %02d/%02d/%04d %02d:%02d:%02d\n",
                          timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
@@ -199,31 +214,6 @@ void setup() {
 
     // NTP
     configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
-    
-    /*
-    // Aguarda sincronização NTP e imprime o tempo
-    Serial.print("Aguardando sincronização NTP...");
-    struct tm timeinfo;
-    int retry = 0;
-    while (!getLocalTime(&timeinfo) && retry < 10) {
-        Serial.print(".");
-        delay(1000);
-        retry++;
-    }
-    if (retry < 10) {
-        Serial.println(" OK!");
-        Serial.println("Tempo obtido via NTP:");
-        Serial.printf("Data/Hora: %02d/%02d/%04d %02d:%02d:%02d\n",
-                     timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
-                     timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
-        
-        time_t now;
-        time(&now);
-        Serial.printf("Timestamp Unix: %lu\n", (unsigned long)now);
-    } else {
-        Serial.println(" FALHOU!");
-    }
-    */
 
     // ESP-NOW
     if (esp_now_init() != ESP_OK) {
@@ -233,6 +223,7 @@ void setup() {
     esp_now_register_recv_cb(OnDataRecv);
 
     // FreeRTOS
+    g_time_sync_event_group = xEventGroupCreate();
     g_incoming_data_queue = xQueueCreate(20, sizeof(master_queue_message_t));
     xTaskCreatePinnedToCore(vMqttSenderTask, "MQTT", 8192, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(vNtpSyncTask, "NTPSync", 4096, NULL, 1, NULL, 0);
