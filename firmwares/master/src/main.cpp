@@ -6,18 +6,7 @@
 #include <freertos/queue.h>
 #include <PubSubClient.h>
 #include "time.h"
-
-// ----------------- CONFIGURAÇÕES -----------------
-const char* WIFI_SSID = "Xze";
-const char* WIFI_PASS = "28072004";
-const char* MQTT_SERVER = "broker.hivemq.com"; // IP do Broker
-const int   MQTT_PORT = 1883;
-const char* MQTT_USER = ""; // Se houver
-const char* MQTT_PASS = ""; // Se houver
-const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = -3 * 3600; // Fuso Horário (Ex: Brasil -3)
-const int   DST_OFFSET_SEC = 0;
-// -------------------------------------------------
+#include "secrets.h"
 
 // --- ESTRUTURAS DE DADOS ---
 typedef enum {
