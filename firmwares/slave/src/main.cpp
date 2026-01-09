@@ -7,9 +7,9 @@
 #include <freertos/event_groups.h>
 #include "time.h"
 #include <DHT.h>
+#include "secrets.h"
 
 // ----------------- CONFIGURAÇÕES -----------------
-uint8_t masterMacAddress[] = {0xB8, 0xF8, 0x62, 0xE2, 0x8A, 0xF8}; // B8:F8:62:E2:8A:F8
 const int SENSOR_INTERVAL_MS = 10000; // Ler a cada 30s
 const int TIME_SYNC_INTERVAL_MS   = 3600000; // Sincronizar relógio a cada 1h
 const int SEND_JITTER_MAX_MS = 500;   // Jitter aleatório
