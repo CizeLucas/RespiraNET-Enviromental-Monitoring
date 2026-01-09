@@ -44,8 +44,7 @@ typedef struct {
 
 // --- GLOBAIS ---
 bool alertEnabled = false;
-const int BEEP_DELAY_MS = 5000;
-bool canSendSensorData = false;
+const int BEEP_DELAY_MS = 1000;
 
 // --- GLOBAIS FREERTOS ---
 QueueHandle_t g_sensor_queue;
@@ -58,11 +57,11 @@ EventGroupHandle_t g_evt_group;
 // --- GLOBAIS DE TEMPO ---
 unsigned long g_epoch_base = 0;
 unsigned long g_millis_base = 0;
-bool g_is_synced = false;
+bool g_is_time_synced = false;
 
 // --- Configurações de GPIO ---
 const int PIN_BUILTIN_LED = 2;
-const int PIN_BUZZER = 23;
+const int PIN_BUZZER = 27;
 
 // --- Configurações Sensores ---
 const int DHT11_PIN = 32;
@@ -71,15 +70,15 @@ const int MQ135_PIN = 35;
 const int MQ2_PIN = 36;
 const sensor_config_t dht11_temperature_sensor = {SENSOR_TYPE_TEMPERATURE, DHT11_PIN, 16.0, 40.0};
 const sensor_config_t dht11_humidity_sensor = {SENSOR_TYPE_HUMIDITY, DHT11_PIN, 20.0, 85.0};
-const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, LDR_PIN, 1023.0, 3069.0};
-const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, MQ135_PIN, 1023.0, 3069.0};
+const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, LDR_PIN, 0.0, 4095.0};
+const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, MQ135_PIN, 512.0, 3583.0};
 const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, MQ2_PIN, 1023.0, 3069.0};
 
 // --- OBJETOS GLOBAIS ---
 DHT dht(DHT11_PIN, DHT11);
 
 // Modo de Teste (Simula sensores com valores aleatórios)
-const bool system_test_mode = true;
+const bool system_test_mode = false;
 
 // Protótipos de funções
 void get_iso_timestamp(char* buffer);
@@ -104,7 +103,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         time_sync_response_t *resp = (time_sync_response_t *)incomingData;
         g_epoch_base = resp->epoch;
         g_millis_base = millis();
-        g_is_synced = true;
+        g_is_time_synced = true;
         
         BaseType_t xHigherPriorityTaskWoken = pdFALSE;
         xEventGroupSetBitsFromISR(g_evt_group, BIT_SYNC_DONE, &xHigherPriorityTaskWoken);
@@ -114,7 +113,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
 
 // --- HELPER DE TIMESTAMP ---
 void get_iso_timestamp(char* buffer) {
-    if (!g_is_synced) {
+    if (!g_is_time_synced) {
         strcpy(buffer, "1970-01-01T00:00:00Z");
         return;
     }
@@ -146,7 +145,6 @@ void vTimeSyncTask(void *pvParam) {
         if (bits & BIT_SYNC_DONE) {
             char timestamp[21];
             get_iso_timestamp(timestamp);
-            canSendSensorData = true;
             Serial.printf("[Sync] Sucesso! Hora atual sincronizada (%s).\n", timestamp);
             vTaskDelay(pdMS_TO_TICKS(TIME_SYNC_INTERVAL_MS)); // Dorme 1h
         } else {
@@ -172,7 +170,7 @@ void vSenderTask(void *pvParam) {
     sensor_payload_t data;
     for (;;) {
         // Consome a fila e caso tenha a hora sincronizada, envia os dados
-        if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE && canSendSensorData) {
+        if (xQueueReceive(g_sensor_queue, &data, portMAX_DELAY) == pdTRUE && g_is_time_synced) {
             bool sent = false;
             int retries = 0;
             
@@ -195,7 +193,7 @@ void vSenderTask(void *pvParam) {
                     retries++;
                 }
             }
-            
+
             if (!sent) {
                 Serial.printf("[Sender] Falha ao enviar dado %.2f do sensor %d após 3 tentativas.\n", data.value, data.type);
                 
