@@ -3,11 +3,10 @@
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <freertos/queue.h>
-#include <freertos/event_groups.h>
 #include "time.h"
-#include <DHT.h>
 #include "secrets.h"
+#include "freertos_globals.h"
+#include "sensors.h"
 
 // ----------------- CONFIGURAÇÕES -----------------
 const int SENSOR_INTERVAL_MS = 10000; // Ler a cada 30s
@@ -16,35 +15,14 @@ const int SEND_JITTER_MAX_MS = 500;   // Jitter aleatório
 // -------------------------------------------------
 
 // --- ESTRUTURAS ---
-typedef enum {
-    SENSOR_TYPE_TEMPERATURE,
-    SENSOR_TYPE_HUMIDITY,
-    SENSOR_TYPE_LDR,
-    SENSOR_TYPE_GAS_MQ135,
-    SENSOR_TYPE_GAS_MQ2,
-    SENSOR_TYPE_TIME_SYNC_REQUEST
-} sensor_type_t;
-
-typedef struct {
-    char timestamp[21];
-    sensor_type_t type;
-    float value;
-} sensor_payload_t;
-
 typedef struct {
     unsigned long epoch;
 } time_sync_response_t;
 
-typedef struct {
-  sensor_type_t type;
-  int sensor_gpio_pin;
-  float min_value; // -999999 se não aplicável
-  float max_value; // 999999 se não aplicável
-} sensor_config_t;
-
 // --- GLOBAIS ---
 bool alertEnabled = false;
 const int BEEP_DELAY_MS = 1000;
+String nodeMacAddress = "";
 
 // --- GLOBAIS FREERTOS ---
 QueueHandle_t g_sensor_queue;
@@ -53,7 +31,6 @@ EventGroupHandle_t g_evt_group;
 #define BIT_ACK_SUCCESS  BIT0  // O envio ESP-NOW foi recebido com sucesso pelo destinatário
 #define BIT_ACK_FAIL     BIT1  // O envio falhou (destinatário não recebeu)
 #define BIT_SYNC_DONE    BIT2  // A resposta de sincronização de tempo chegou
-#define BIT_TIME_SYNCED  BIT3  // Tempo sincronizado, libera sensores
 
 // --- GLOBAIS DE TEMPO ---
 unsigned long g_epoch_base = 0;
@@ -64,26 +41,10 @@ bool g_is_time_synced = false;
 const int PIN_BUILTIN_LED = 2;
 const int PIN_BUZZER = 27;
 
-// --- Configurações Sensores ---
-const int DHT11_PIN = 32;
-const int LDR_PIN = 34;
-const int MQ135_PIN = 35;
-const int MQ2_PIN = 36;
-const sensor_config_t dht11_temperature_sensor = {SENSOR_TYPE_TEMPERATURE, DHT11_PIN, 16.0, 40.0};
-const sensor_config_t dht11_humidity_sensor = {SENSOR_TYPE_HUMIDITY, DHT11_PIN, 20.0, 85.0};
-const sensor_config_t ldr_sensor = {SENSOR_TYPE_LDR, LDR_PIN, 0.0, 4095.0};
-const sensor_config_t mq135_sensor = {SENSOR_TYPE_GAS_MQ135, MQ135_PIN, 512.0, 3583.0};
-const sensor_config_t mq2_sensor = {SENSOR_TYPE_GAS_MQ2, MQ2_PIN, 1023.0, 3069.0};
-
-// --- OBJETOS GLOBAIS ---
-DHT dht(DHT11_PIN, DHT11);
-
 // Modo de Teste (Simula sensores com valores aleatórios)
 const bool system_test_mode = false;
 
 // Protótipos de funções
-void get_iso_timestamp(char* buffer);
-void check_value_bounds(sensor_payload_t* data, const sensor_config_t* config);
 void ligarAlerta();
 void scanForMaster();
 
@@ -214,167 +175,6 @@ void vSenderTask(void *pvParam) {
     }
 }
 
-// --- TAREFAS: SENSORES ---
-void vSensorDHT11(void *pvParam) {
-    dht.begin();
-    
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-
-        // Leitura de Temperatura:
-        float t = dht.readTemperature();
-        if (!isnan(t)) {
-            data.type = SENSOR_TYPE_TEMPERATURE;
-            data.value = t;
-            get_iso_timestamp(data.timestamp);
-            check_value_bounds(&data, &dht11_temperature_sensor);
-            
-            // Só envia para fila se o tempo estiver sincronizado
-            EventBits_t bits = xEventGroupGetBits(g_evt_group);
-            if (bits & BIT_TIME_SYNCED) {
-                xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-            }
-        } else {
-            Serial.println("[DHT11] Falha na leitura de Temperatura!");
-        }
-
-        // Leitura de Umidade:
-        float h = dht.readHumidity();
-        if (!isnan(h)) {
-            data.type = SENSOR_TYPE_HUMIDITY;
-            data.value = h;
-            get_iso_timestamp(data.timestamp);
-            check_value_bounds(&data, &dht11_humidity_sensor);
-            
-            // Só envia para fila se o tempo estiver sincronizado
-            EventBits_t bits = xEventGroupGetBits(g_evt_group);
-            if (bits & BIT_TIME_SYNCED) {
-                xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-            }
-        } else {
-            Serial.println("[DHT11] Falha na leitura de Umidade!");
-        }
-    }
-}
-
-void vSensorMQ135(void *pvParam) {
-    pinMode(MQ135_PIN, INPUT);
-    
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-        int raw_value = analogRead(MQ135_PIN);
-
-        data.type = SENSOR_TYPE_GAS_MQ135;
-        data.value = (float)raw_value; 
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &mq135_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        EventBits_t bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-    }
-}
-
-void vSensorLDR(void *pvParam) {
-    pinMode(LDR_PIN, INPUT);
-    
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-        int raw_value = analogRead(LDR_PIN);
-
-        data.type = SENSOR_TYPE_LDR;
-        data.value = (float)raw_value;
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &ldr_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        EventBits_t bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-    }
-}
-
-// --- IMPLEMENTAÇÃO DE TAREFAS MOCKADAS DE SENSORES (TESTE) ---
-void vMockedSensorDHT11(void *pvParam) {
-    
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-
-        // Leitura de Temperatura:
-        data.type = SENSOR_TYPE_TEMPERATURE;
-        data.value = random(2000, 3500) / 100.0; // Simula 20.00 a 35.00
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &dht11_temperature_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        EventBits_t bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-
-        // Leitura de Umidade:
-        data.type = SENSOR_TYPE_HUMIDITY;
-        data.value = random(0, 100); // Simula 0.00 a 100.00
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &dht11_humidity_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-    }
-}
-
-void vMockedSensorMQ135(void *pvParam) {    
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-
-        data.type = SENSOR_TYPE_GAS_MQ135;
-        data.value = random(0, 4095); // Simula 0 a 4095
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &mq135_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        EventBits_t bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-    }
-}
-
-void vMockedSensorLDR(void *pvParam) {
-    for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_INTERVAL_MS));
-        
-        sensor_payload_t data;
-
-        data.type = SENSOR_TYPE_GAS_MQ135;
-        data.value = random(0, 4095); // Simula 0 a 4095
-        get_iso_timestamp(data.timestamp);
-        check_value_bounds(&data, &mq135_sensor);
-        
-        // Só envia para fila se o tempo estiver sincronizado
-        EventBits_t bits = xEventGroupGetBits(g_evt_group);
-        if (bits & BIT_TIME_SYNCED) {
-            xQueueSend(g_sensor_queue, &data, pdMS_TO_TICKS(100));
-        }
-    }
-}
-
 void vTaskBuzzer(void *parameter) {
   pinMode(PIN_BUZZER, OUTPUT);
 
@@ -454,6 +254,8 @@ void setup() {
 
     Serial.begin(115200);
     WiFi.mode(WIFI_STA);
+    nodeMacAddress = WiFi.macAddress();
+    Serial.printf("\nWiFi OK. MAC: %s\n", nodeMacAddress.c_str());
     
     if (esp_now_init() != ESP_OK) { Serial.println("Erro ESP-NOW"); return; }
     
