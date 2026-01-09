@@ -36,6 +36,8 @@ typedef struct {
 
 // --- GLOBAIS ---
 String masterMacAddress = "";
+const int TIME_SYNC_INTERVAL_MS = 3600000;
+volatile bool g_is_time_synced = false;
 QueueHandle_t g_incoming_data_queue;
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
@@ -75,7 +77,6 @@ void OnDataRecv(const uint8_t * mac_addr, const uint8_t *incomingData, int len) 
             memcpy(peerInfo.peer_addr, mac_addr, 6);
             peerInfo.channel = 0;
             peerInfo.encrypt = false;
-            esp_now_add_peer(&peerInfo);
 
             // Verifica erro ao adicionar
             esp_err_t addStatus = esp_now_add_peer(&peerInfo);
@@ -112,7 +113,13 @@ void vMqttSenderTask(void *pvParameters) {
     char topic[128];
     char payload_json[128];
 
-    for (;;) {
+    for(;;) {
+        // Apenas envia dados após sincronização de tempo NTP
+        if(!g_is_time_synced) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
         // Mantém conexão MQTT
         if (!mqttClient.connected()) {
             while (!mqttClient.connected()) {
@@ -148,6 +155,37 @@ void vMqttSenderTask(void *pvParameters) {
     }
 }
 
+// --- TAREFA DE SINCRONIZAÇÃO NTP ---
+void vNtpSyncTask(void *pvParameters) {
+    for (;;) {        
+        // Sincroniza o tempo NTP
+        Serial.println("Sincronizando tempo via NTP...");
+        configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
+        
+        // Aguarda sincronização
+        struct tm timeinfo;
+        int retry = 0;
+        while (!getLocalTime(&timeinfo) && retry < 10) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            retry++;
+        }
+        
+        if (retry < 10) {
+            g_is_time_synced = true;
+            Serial.println("Tempo NTP atualizado com sucesso!");
+            Serial.printf("Data/Hora: %02d/%02d/%04d %02d:%02d:%02d\n",
+                         timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900,
+                         timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+            // Aguarda antes da próxima sincronização
+            vTaskDelay(pdMS_TO_TICKS(TIME_SYNC_INTERVAL_MS));
+        } else {
+            Serial.println("Falha ao sincronizar tempo NTP. Tentando novamente em 30s...");
+            // Aguarda 30 segundos antes de tentar novamente
+            vTaskDelay(pdMS_TO_TICKS(10000));
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     
@@ -162,6 +200,7 @@ void setup() {
     // NTP
     configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP_SERVER);
     
+    /*
     // Aguarda sincronização NTP e imprime o tempo
     Serial.print("Aguardando sincronização NTP...");
     struct tm timeinfo;
@@ -184,6 +223,7 @@ void setup() {
     } else {
         Serial.println(" FALHOU!");
     }
+    */
 
     // ESP-NOW
     if (esp_now_init() != ESP_OK) {
@@ -195,6 +235,7 @@ void setup() {
     // FreeRTOS
     g_incoming_data_queue = xQueueCreate(20, sizeof(master_queue_message_t));
     xTaskCreatePinnedToCore(vMqttSenderTask, "MQTT", 8192, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(vNtpSyncTask, "NTPSync", 4096, NULL, 1, NULL, 0);
     
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
 }
