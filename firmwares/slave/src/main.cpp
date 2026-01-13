@@ -3,6 +3,8 @@
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <SD.h>
+#include <SPI.h>
 #include "time.h"
 #include "secrets.h"
 #include "freertos_globals.h"
@@ -40,6 +42,7 @@ bool g_is_time_synced = false;
 // --- Configurações de GPIO ---
 const int PIN_BUILTIN_LED = 2;
 const int PIN_BUZZER = 27;
+const int PIN_SD_CS = 5; // Chip Select do SD Card
 
 // Modo de Teste (Simula sensores com valores aleatórios)
 const bool system_test_mode = false;
@@ -115,7 +118,7 @@ void vTimeSyncTask(void *pvParam) {
             
             if (tries >= 3) {
                 Serial.println("[Sync] 3 falhas consecutivas. Iniciando re-escaneamento do Master...");
-                scanForMaster();
+                scanForMaster(); 
                 tries = 0;
             }
             vTaskDelay(pdMS_TO_TICKS(10000));
@@ -166,11 +169,38 @@ void vSenderTask(void *pvParam) {
             if (!sent) {
                 Serial.printf("[Sender] Falha ao enviar dado %.2f do sensor %d após 3 tentativas.\n", data.value, data.type);
                 
+                // Grava no SD Card
+                if (xQueueSend(g_sdcard_queue, &data, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    Serial.println("[Sender] Dado enfileirado para gravação no SD Card");
+                }
+                
                 Serial.println("[Sender] Iniciando re-escaneamento do Master...");
                 scanForMaster();
-
-                //TODO: Popular fila de falhas para serem gravadas no SD Card
             }
+        }
+    }
+}
+
+// --- TAREFA: GRAVAÇÃO NO SD CARD ---
+void vTaskSDCard(void *pvParam) {
+    sensor_payload_t data;
+    
+    for (;;) {
+        // Aguarda dados na fila de falhas para gravar no SD
+        if (xQueueReceive(g_sdcard_queue, &data, portMAX_DELAY) == pdTRUE) {
+            File file = SD.open("/slave_data.txt", FILE_APPEND);
+            
+            if (!file) {
+                Serial.println("[SD] Erro ao abrir arquivo para escrita");
+                continue;
+            }
+            
+            // Grava: timestamp, tipo, valor
+            file.printf("%s,%d,%.2f\n", data.timestamp, data.type, data.value);
+            file.close();
+            
+            Serial.printf("[SD] Gravado: %s | Sensor %d | Val: %.2f\n", 
+                         data.timestamp, data.type, data.value);
         }
     }
 }
@@ -269,14 +299,23 @@ void setup() {
     peerInfo.encrypt = false;
     esp_now_add_peer(&peerInfo);
 
+    // Inicialização do SD Card
+    if (!SD.begin(PIN_SD_CS)) {
+        Serial.println("[SD] Falha ao inicializar o cartão SD!");
+    } else {
+        Serial.println("[SD] Cartão SD inicializado com sucesso");
+    }
+
     // FreeRTOS
     g_sensor_queue = xQueueCreate(10, sizeof(sensor_payload_t));
+    g_sdcard_queue = xQueueCreate(20, sizeof(sensor_payload_t)); // Fila maior para armazenar falhas
     g_evt_group = xEventGroupCreate();
 
     scanForMaster();
 
     xTaskCreate(vTimeSyncTask, "Sync", 2048, NULL, 3, NULL); // Prioridade Alta
     xTaskCreate(vSenderTask, "Send", 4096, NULL, 2, NULL);
+    xTaskCreate(vTaskSDCard, "SDCard", 4096, NULL, 2, NULL); // Mesma prioridade do Sender
     xTaskCreate(system_test_mode ? vMockedSensorDHT11 : vSensorDHT11, "DHT11", 2048, NULL, 1, NULL);
     xTaskCreate(system_test_mode ? vMockedSensorMQ135 : vSensorMQ135, "MQ135", 2048, NULL, 1, NULL);
     xTaskCreate(system_test_mode ? vMockedSensorLDR : vSensorLDR, "LDR", 2048, NULL, 1, NULL);
