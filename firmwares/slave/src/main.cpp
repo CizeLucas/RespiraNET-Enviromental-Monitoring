@@ -30,9 +30,10 @@ String nodeMacAddress = "";
 QueueHandle_t g_sensor_queue;
 QueueHandle_t g_sdcard_queue;
 EventGroupHandle_t g_evt_group;
-#define BIT_ACK_SUCCESS  BIT0  // O envio ESP-NOW foi recebido com sucesso pelo destinatário
-#define BIT_ACK_FAIL     BIT1  // O envio falhou (destinatário não recebeu)
-#define BIT_SYNC_DONE    BIT2  // A resposta de sincronização de tempo chegou
+#define BIT_ACK_SUCCESS     BIT0  // O envio ESP-NOW foi recebido com sucesso pelo destinatário
+#define BIT_ACK_FAIL        BIT1  // O envio falhou (destinatário não recebeu)
+#define BIT_SYNC_DONE       BIT2  // A resposta de sincronização de tempo chegou
+#define BIT_SCAN_REQUESTED  BIT4  // Requisição para iniciar scan do Master
 
 // --- GLOBAIS DE TEMPO ---
 unsigned long g_epoch_base = 0;
@@ -117,8 +118,8 @@ void vTimeSyncTask(void *pvParam) {
             Serial.printf("[Sync] Falha/Timeout (Tentativa %d/3). Tentando novamente em 10s...\n", tries);
             
             if (tries >= 3) {
-                Serial.println("[Sync] 3 falhas consecutivas. Iniciando re-escaneamento do Master...");
-                scanForMaster(); 
+                Serial.println("[Sync] 3 falhas consecutivas. Requisitando re-escaneamento do Master...");
+                xEventGroupSetBits(g_evt_group, BIT_SCAN_REQUESTED);
                 tries = 0;
             }
             vTaskDelay(pdMS_TO_TICKS(10000));
@@ -174,8 +175,8 @@ void vSenderTask(void *pvParam) {
                     Serial.println("[Sender] Dado enfileirado para gravação no SD Card");
                 }
                 
-                Serial.println("[Sender] Iniciando re-escaneamento do Master...");
-                scanForMaster();
+                Serial.println("[Sender] Requisitando re-escaneamento do Master...");
+                xEventGroupSetBits(g_evt_group, BIT_SCAN_REQUESTED);
             }
         }
     }
@@ -228,7 +229,60 @@ void ligarAlerta() {
   alertEnabled = true;
 }
 
-// --- FUNÇÃO DE VARREDURA DE CANAL ---
+// --- TAREFA: VARREDURA DE CANAL ---
+void vScanTask(void *pvParam) {
+    for (;;) {
+        // Aguarda requisição de scan
+        xEventGroupWaitBits(g_evt_group, BIT_SCAN_REQUESTED, pdTRUE, pdFALSE, portMAX_DELAY);
+        
+        int32_t channel = 1;
+        bool found = false;
+        
+        Serial.println("[Scan] Procurando o Master nos canais Wi-Fi...");
+
+        while(!found) {
+            // Tenta nos canais 1 a 13
+            for (channel = 1; channel <= 13; channel++) {
+                // Muda o canal do rádio
+                esp_wifi_set_promiscuous(true);
+                esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+                esp_wifi_set_promiscuous(false);
+                
+                Serial.printf("... Testando Canal %d\n", channel);
+
+                // Envia um pacote de teste (Sync Request é leve)
+                sensor_payload_t ping;
+                ping.type = SENSOR_TYPE_TIME_SYNC_REQUEST;
+                strcpy(ping.timestamp, "");
+                ping.value = 0;
+
+                // Limpa flags
+                xEventGroupClearBits(g_evt_group, BIT_ACK_SUCCESS | BIT_ACK_FAIL);
+                
+                // Envia
+                esp_now_send(masterMacAddress, (uint8_t *)&ping, sizeof(ping));
+
+                // Espera ACK por 100ms (rápido)
+                EventBits_t bits = xEventGroupWaitBits(g_evt_group, BIT_ACK_SUCCESS, pdTRUE, pdFALSE, pdMS_TO_TICKS(100));
+
+                if (bits & BIT_ACK_SUCCESS) {
+                    Serial.printf("[Scan] Mestre encontrado no Canal %d!\n", channel);
+                    found = true;
+                    break; // Sai do loop, estamos no canal certo
+                }
+            }
+
+            if (!found) {
+                Serial.println("[Scan] Mestre NÃO encontrado. Tentando novamente...");
+                vTaskDelay(pdMS_TO_TICKS(2000)); // Espera 2s antes de tentar novamente
+            }
+        }
+        
+        Serial.println("[Scan] Scan concluído, canal sincronizado.");
+    }
+}
+
+// --- FUNÇÃO DE VARREDURA DE CANAL (Para uso no setup) ---
 void scanForMaster() {
     int32_t channel = 1;
     bool found = false;
@@ -269,10 +323,9 @@ void scanForMaster() {
 
         if (!found) {
             Serial.println("[Scan] Mestre NÃO encontrado. Tentando novamente...");
-            vTaskDelay(pdMS_TO_TICKS(2000)); // Espera 2s antes de tentar novamente
+            delay(2000); // Espera 2s antes de tentar novamente (delay normal pois não estamos em tarefa ainda)
         }
     }
-
 }
 
 void setup() {
@@ -313,6 +366,7 @@ void setup() {
 
     scanForMaster();
 
+    xTaskCreate(vScanTask, "Scan", 2048, NULL, 3, NULL); // Prioridade Alta (mesma do Sync)
     xTaskCreate(vTimeSyncTask, "Sync", 2048, NULL, 3, NULL); // Prioridade Alta
     xTaskCreate(vSenderTask, "Send", 4096, NULL, 2, NULL);
     xTaskCreate(vTaskSDCard, "SDCard", 4096, NULL, 2, NULL); // Mesma prioridade do Sender
